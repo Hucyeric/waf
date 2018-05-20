@@ -6,23 +6,8 @@
 Runner.py: Task scheduling and execution
 """
 
+import asyncio
 import heapq, traceback
-try:
-	from queue import Queue, PriorityQueue
-except ImportError:
-	from Queue import Queue
-	try:
-		from Queue import PriorityQueue
-	except ImportError:
-		class PriorityQueue(Queue):
-			def _init(self, maxsize):
-				self.maxsize = maxsize
-				self.queue = []
-			def _put(self, item):
-				heapq.heappush(self.queue, item)
-			def _get(self):
-				return heapq.heappop(self.queue)
-
 from waflib import Utils, Task, Errors, Logs
 
 GAP = 5
@@ -57,69 +42,39 @@ class PriorityTasks(object):
 			else:
 				self.lst = lst.lst
 
-class Consumer(Utils.threading.Thread):
-	"""
-	Daemon thread object that executes a task. It shares a semaphore with
-	the coordinator :py:class:`waflib.Runner.Spawner`. There is one
-	instance per task to consume.
-	"""
-	def __init__(self, spawner, task):
-		Utils.threading.Thread.__init__(self)
+class Consumer(object):
+	def __init__(self, spawner, task, loop):
 		self.task = task
-		"""Task to execute"""
 		self.spawner = spawner
-		"""Coordinator object"""
-		self.setDaemon(1)
-		self.start()
-	def run(self):
-		"""
-		Processes a single task
-		"""
+		self.loop = loop
+
+	async def run(self):
 		try:
 			if not self.spawner.master.stop:
 				self.spawner.master.process_task(self.task)
 		finally:
 			self.spawner.sem.release()
-			self.spawner.master.out.put(self.task)
+			await self.spawner.master.out.put(self.task)
 			self.task = None
 			self.spawner = None
 
-class Spawner(Utils.threading.Thread):
-	"""
-	Daemon thread that consumes tasks from :py:class:`waflib.Runner.Parallel` producer and
-	spawns a consuming thread :py:class:`waflib.Runner.Consumer` for each
-	:py:class:`waflib.Task.Task` instance.
-	"""
-	def __init__(self, master):
-		Utils.threading.Thread.__init__(self)
+class Spawner(object):
+	def __init__(self, master, loop):
+		self.loop = loop
 		self.master = master
-		""":py:class:`waflib.Runner.Parallel` producer instance"""
-		self.sem = Utils.threading.Semaphore(master.numjobs)
-		"""Bounded semaphore that prevents spawning more than *n* concurrent consumers"""
-		self.setDaemon(1)
-		self.start()
-	def run(self):
-		"""
-		Spawns new consumers to execute tasks by delegating to :py:meth:`waflib.Runner.Spawner.loop`
-		"""
-		try:
-			self.loop()
-		except Exception:
-			# Python 2 prints unnecessary messages when shutting down
-			# we also want to stop the thread properly
-			pass
-	def loop(self):
-		"""
-		Consumes task objects from the producer; ends when the producer has no more
-		task to provide.
-		"""
+		self.sem = asyncio.Semaphore(master.numjobs, loop=loop)
+
+	async def run(self):
 		master = self.master
 		while 1:
-			task = master.ready.get()
-			self.sem.acquire()
+			task = await master.ready.get()
+			if not task:
+				return
+			await self.sem.acquire()
 			if not master.stop:
 				task.log_display(task.generator.bld)
-			Consumer(self, task)
+			cons = Consumer(self, task, self.loop)
+			self.loop.create_task(cons.run())
 
 class Parallel(object):
 	"""
@@ -150,10 +105,10 @@ class Parallel(object):
 		self.incomplete = set()
 		"""List of :py:class:`waflib.Task.Task` waiting for dependent tasks to complete (DAG)"""
 
-		self.ready = PriorityQueue(0)
+		self.ready = asyncio.PriorityQueue()
 		"""List of :py:class:`waflib.Task.Task` ready to be executed by consumers"""
 
-		self.out = Queue(0)
+		self.out = asyncio.Queue()
 		"""List of :py:class:`waflib.Task.Task` returned by the task consumers"""
 
 		self.count = 0
@@ -181,7 +136,9 @@ class Parallel(object):
 		The reverse dependency graph of dependencies obtained from Task.run_after
 		"""
 
-		self.spawner = Spawner(self)
+		self.loop = asyncio.get_event_loop()
+
+		self.spawner = Spawner(self, self.loop)
 		"""
 		Coordinating daemon thread that spawns thread consumers
 		"""
@@ -206,17 +163,17 @@ class Parallel(object):
 		"""
 		self.postponed.append(tsk)
 
-	def refill_task_list(self):
+	async def refill_task_list(self):
 		"""
 		Pulls a next group of tasks to execute in :py:attr:`waflib.Runner.Parallel.outstanding`.
 		Ensures that all tasks in the current build group are complete before processing the next one.
 		"""
 		while self.count > self.numjobs * GAP:
-			self.get_out()
+			await self.get_out()
 
 		while not self.outstanding:
 			if self.count:
-				self.get_out()
+				await self.get_out()
 				if self.outstanding:
 					break
 			elif self.postponed:
@@ -323,14 +280,14 @@ class Parallel(object):
 					try_unfreeze(x)
 			del self.revdeps[tsk]
 
-	def get_out(self):
+	async def get_out(self):
 		"""
 		Waits for a Task that task consumers add to :py:attr:`waflib.Runner.Parallel.out` after execution.
 		Adds more Tasks if necessary through :py:attr:`waflib.Runner.Parallel.add_more_tasks`.
 
 		:rtype: :py:attr:`waflib.Task.Task`
 		"""
-		tsk = self.out.get()
+		tsk = await self.out.get()
 		if not self.stop:
 			self.add_more_tasks(tsk)
 		self.mark_finished(tsk)
@@ -339,14 +296,14 @@ class Parallel(object):
 		self.dirty = True
 		return tsk
 
-	def add_task(self, tsk):
+	async def add_task(self, tsk):
 		"""
 		Enqueue a Task to :py:attr:`waflib.Runner.Parallel.ready` so that consumers can run them.
 
 		:param tsk: task instance
 		:type tsk: :py:attr:`waflib.Task.Task`
 		"""
-		self.ready.put(tsk)
+		await self.ready.put(tsk)
 
 	def process_task(self, tsk):
 		"""
@@ -414,6 +371,9 @@ class Parallel(object):
 			return Task.EXCEPTION
 
 	def start(self):
+		self.loop.run_until_complete(self.async_start())
+
+	async def async_start(self):
 		"""
 		Obtains Task instances from the BuildContext instance and adds the ones that need to be executed to
 		:py:class:`waflib.Runner.Parallel.ready` so that the :py:class:`waflib.Runner.Spawner` consumer thread
@@ -423,9 +383,12 @@ class Parallel(object):
 		"""
 		self.total = self.bld.total()
 
+		#self.loop.call_soon(self.spawner.run)
+		self.loop.create_task(self.spawner.run())
+
 		while not self.stop:
 
-			self.refill_task_list()
+			await self.refill_task_list()
 
 			# consider the next task
 			tsk = self.get_next_task()
@@ -455,9 +418,9 @@ class Parallel(object):
 					try:
 						self.process_task(tsk)
 					finally:
-						self.out.put(tsk)
+						await self.out.put(tsk)
 				else:
-					self.add_task(tsk)
+					await self.add_task(tsk)
 			elif st == Task.ASK_LATER:
 				self.postpone(tsk)
 			elif st == Task.SKIP_ME:
@@ -477,7 +440,7 @@ class Parallel(object):
 		while self.error and self.count:
 			self.get_out()
 
-		self.ready.put(None)
+		await self.ready.put(None)
 		if not self.stop:
 			assert not self.count
 			assert not self.postponed
