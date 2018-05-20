@@ -95,12 +95,13 @@ class store_task_type(type):
 		if name != 'evil' and name != 'Task':
 			if getattr(cls, 'run_str', None):
 				# if a string is provided, convert it to a method
-				(f, dvars) = compile_fun(cls.run_str, cls.shell)
+				(f, async_f, dvars) = compile_fun(cls.run_str, cls.shell)
 				cls.hcode = Utils.h_cmd(cls.run_str)
 				cls.orig_run_str = cls.run_str
 				# change the name of run_str or it is impossible to subclass with a function
 				cls.run_str = None
 				cls.run = f
+				cls.async_run = async_f
 				cls.vars = list(set(cls.vars + dvars))
 				cls.vars.sort()
 			elif getattr(cls, 'run', None) and not 'hcode' in cls.__dict__:
@@ -248,6 +249,61 @@ class Task(evil):
 		"""
 		return ([cmd[0]], [self.quote_flag(x) for x in cmd[1:]])
 
+	async def async_exec_command(self, cmd, **kw):
+		"""
+		Wrapper for :py:meth:`waflib.Context.Context.exec_command`.
+		This version set the current working directory (``build.variant_dir``),
+		applies PATH settings (if self.env.PATH is provided), and can run long
+		commands through a temporary ``@argfile``.
+
+		:param cmd: process command to execute
+		:type cmd: list of string (best) or string (process will use a shell)
+		:return: the return code
+		:rtype: int
+
+		Optional parameters:
+
+		#. cwd: current working directory (Node or string)
+		#. stdout: set to None to prevent waf from capturing the process standard output
+		#. stderr: set to None to prevent waf from capturing the process standard error
+		#. timeout: timeout value (Python 3)
+		"""
+		if not 'cwd' in kw:
+			kw['cwd'] = self.get_cwd()
+
+		if hasattr(self, 'timeout'):
+			kw['timeout'] = self.timeout
+
+		if self.env.PATH:
+			env = kw['env'] = dict(kw.get('env') or self.env.env or os.environ)
+			env['PATH'] = self.env.PATH if isinstance(self.env.PATH, str) else os.pathsep.join(self.env.PATH)
+
+		if hasattr(self, 'stdout'):
+			kw['stdout'] = self.stdout
+		if hasattr(self, 'stderr'):
+			kw['stderr'] = self.stderr
+
+		# workaround for command line length limit:
+		# http://support.microsoft.com/kb/830473
+		if not isinstance(cmd, str) and (len(repr(cmd)) >= 8192 if Utils.is_win32 else len(cmd) > 200000):
+			cmd, args = self.split_argfile(cmd)
+			try:
+				(fd, tmp) = tempfile.mkstemp()
+				os.write(fd, '\r\n'.join(args).encode())
+				os.close(fd)
+				if Logs.verbose:
+					Logs.debug('argfile: @%r -> %r', tmp, args)
+				return await self.generator.bld.async_exec_command(cmd + ['@' + tmp], **kw)
+			finally:
+				try:
+					os.remove(tmp)
+				except OSError:
+					# anti-virus and indexers can keep files open -_-
+					pass
+		else:
+			return await self.generator.bld.async_exec_command(cmd, **kw)
+
+
 	def exec_command(self, cmd, **kw):
 		"""
 		Wrapper for :py:meth:`waflib.Context.Context.exec_command`.
@@ -301,6 +357,51 @@ class Task(evil):
 					pass
 		else:
 			return self.generator.bld.exec_command(cmd, **kw)
+
+	async def async_process(self):
+		"""
+		Runs the task and handles errors
+
+		:return: 0 or None if everything is fine
+		:rtype: integer
+		"""
+		# remove the task signature immediately before it is executed
+		# so that the task will be executed again in case of failure
+		try:
+			del self.generator.bld.task_sigs[self.uid()]
+		except KeyError:
+			pass
+
+		try:
+			if hasattr(self, 'async_run'):
+				ret = await self.async_run()
+			else:
+				ret = self.run()
+		except Exception:
+			self.err_msg = traceback.format_exc()
+			self.hasrun = EXCEPTION
+		else:
+			if ret:
+				self.err_code = ret
+				self.hasrun = CRASHED
+			else:
+				try:
+					self.post_run()
+				except Errors.WafError:
+					pass
+				except Exception:
+					self.err_msg = traceback.format_exc()
+					self.hasrun = EXCEPTION
+				else:
+					self.hasrun = SUCCESS
+
+		if self.hasrun != SUCCESS and self.scan:
+			# rescan dependencies on next run
+			try:
+				del self.generator.bld.imp_sigs[self.uid()]
+			except KeyError:
+				pass
+
 
 	def process(self):
 		"""
@@ -1092,8 +1193,10 @@ def compile_fun_shell(line):
 		parm = ''
 
 	c = COMPILE_TEMPLATE_SHELL % (line, parm)
+	async_c = c.replace('def f(', 'async def f(').replace('return tsk.exec_command(', 'return await tsk.async_exec_command(')
+
 	Logs.debug('action: %s', c.strip().splitlines())
-	return (funex(c), dvars)
+	return (funex(c), funex(async_c), dvars)
 
 reg_act_noshell = re.compile(r"(?P<space>\s+)|(?P<subst>\$\{(?P<var>\w+)(?P<code>.*?)\})|(?P<text>([^$ \t\n\r\f\v]|\$\$)+)", re.M)
 def compile_fun_noshell(line):
@@ -1174,8 +1277,10 @@ def compile_fun_noshell(line):
 
 	buf = ['lst.extend(%s)' % x for x in buf]
 	fun = COMPILE_TEMPLATE_NOSHELL % "\n\t".join(buf)
+	async_fun = fun.replace('def f(', 'async def f(').replace('return tsk.exec_command(', 'return await tsk.async_exec_command(')
+
 	Logs.debug('action: %s', fun.strip().splitlines())
-	return (funex(fun), dvars)
+	return (funex(fun), funex(async_fun), dvars)
 
 def compile_fun(line, shell=False):
 	"""

@@ -11,7 +11,7 @@ through Python versions 2.5 to 3.X and across different platforms (win32, linux,
 
 from __future__ import with_statement
 
-import atexit, os, sys, errno, inspect, re, datetime, platform, base64, signal, functools, time
+import asyncio, atexit, os, sys, errno, inspect, re, datetime, platform, base64, signal, functools, time
 
 try:
 	import cPickle
@@ -873,6 +873,55 @@ def get_process():
 		cmd = [sys.executable, '-c', readf(filepath)]
 		return subprocess.Popen(cmd, stdout=subprocess.PIPE, stdin=subprocess.PIPE, bufsize=0)
 
+async_process_pool = []
+async def async_get_process():
+	try:
+		return async_process_pool.pop()
+	except IndexError:
+		filepath = os.path.dirname(os.path.abspath(__file__)) + os.sep + 'processor.py'
+		cmd = [sys.executable, '-c', readf(filepath)]
+		proc = asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stdin=subprocess.PIPE, bufsize=0)
+		process = await proc
+		return process
+
+async def async_run_prefork_process(cmd, kwargs, cargs):
+	if not 'env' in kwargs:
+		kwargs['env'] = dict(os.environ)
+	try:
+		obj = base64.b64encode(cPickle.dumps([cmd, kwargs, cargs]))
+	except (TypeError, AttributeError):
+		return run_regular_process(cmd, kwargs, cargs)
+
+	proc = await async_get_process()
+	if not proc:
+		return run_regular_process(cmd, kwargs, cargs)
+
+	proc.stdin.write(obj)
+	proc.stdin.write('\n'.encode())
+	await proc.stdin.drain()
+	obj = await proc.stdout.readline()
+	if not obj:
+		raise OSError('Preforked sub-process %r died' % proc.pid)
+
+	async_process_pool.append(proc)
+	lst = cPickle.loads(base64.b64decode(obj))
+	# Jython wrapper failures (bash/execvp)
+	assert len(lst) == 5
+	ret, out, err, ex, trace = lst
+	if ex:
+		if ex == 'OSError':
+			raise OSError(trace)
+		elif ex == 'ValueError':
+			raise ValueError(trace)
+		elif ex == 'TimeoutExpired':
+			exc = TimeoutExpired(cmd, timeout=cargs['timeout'], output=out)
+			exc.stderr = err
+			raise exc
+		else:
+			raise Exception(trace)
+	return ret, out, err
+
+
 def run_prefork_process(cmd, kwargs, cargs):
 	"""
 	Delegates process execution to a pre-forked process instance.
@@ -976,6 +1025,12 @@ def run_process(cmd, kwargs, cargs={}):
 	"""
 	if kwargs.get('stdout') and kwargs.get('stderr'):
 		return run_prefork_process(cmd, kwargs, cargs)
+	else:
+		return run_regular_process(cmd, kwargs, cargs)
+
+async def async_run_process(cmd, kwargs, cargs={}):
+	if kwargs.get('stdout') and kwargs.get('stderr'):
+		return await async_run_prefork_process(cmd, kwargs, cargs)
 	else:
 		return run_regular_process(cmd, kwargs, cargs)
 

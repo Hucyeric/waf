@@ -304,6 +304,64 @@ class Context(ctx):
 			Logs.debug('runner: %r', cmd)
 			Logs.debug('runner_env: kw=%s', kw)
 
+	async def async_exec_command(self, cmd, **kw):
+		subprocess = Utils.subprocess
+		kw['shell'] = isinstance(cmd, str)
+		self.log_command(cmd, kw)
+
+		if self.logger:
+			self.logger.info(cmd)
+
+		if 'stdout' not in kw:
+			kw['stdout'] = subprocess.PIPE
+		if 'stderr' not in kw:
+			kw['stderr'] = subprocess.PIPE
+
+		if Logs.verbose and not kw['shell'] and not Utils.check_exe(cmd[0]):
+			raise Errors.WafError('Program %s not found!' % cmd[0])
+
+		cargs = {}
+		if 'timeout' in kw:
+			if sys.hexversion >= 0x3030000:
+				cargs['timeout'] = kw['timeout']
+				if not 'start_new_session' in kw:
+					kw['start_new_session'] = True
+			del kw['timeout']
+		if 'input' in kw:
+			if kw['input']:
+				cargs['input'] = kw['input']
+				kw['stdin'] = subprocess.PIPE
+			del kw['input']
+
+		if 'cwd' in kw:
+			if not isinstance(kw['cwd'], str):
+				kw['cwd'] = kw['cwd'].abspath()
+
+		encoding = kw.pop('decode_as', default_encoding)
+
+		try:
+			ret, out, err = await Utils.async_run_process(cmd, kw, cargs)
+		except Exception as e:
+			raise Errors.WafError('Execution failure: %s' % str(e), ex=e)
+
+		if out:
+			if not isinstance(out, str):
+				out = out.decode(encoding, errors='replace')
+			if self.logger:
+				self.logger.debug('out: %s', out)
+			else:
+				Logs.info(out, extra={'stream':sys.stdout, 'c1': ''})
+		if err:
+			if not isinstance(err, str):
+				err = err.decode(encoding, errors='replace')
+			if self.logger:
+				self.logger.error('err: %s' % err)
+			else:
+				Logs.info(err, extra={'stream':sys.stderr, 'c1': ''})
+
+		return ret
+
+
 	def exec_command(self, cmd, **kw):
 		"""
 		Runs an external process and returns the exit status::

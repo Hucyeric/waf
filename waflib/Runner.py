@@ -51,7 +51,7 @@ class Consumer(object):
 	async def run(self):
 		try:
 			if not self.spawner.master.stop:
-				self.spawner.master.process_task(self.task)
+				await self.spawner.master.process_task(self.task)
 		finally:
 			self.spawner.sem.release()
 			await self.spawner.master.out.put(self.task)
@@ -305,11 +305,11 @@ class Parallel(object):
 		"""
 		await self.ready.put(tsk)
 
-	def process_task(self, tsk):
+	async def process_task(self, tsk):
 		"""
 		Processes a task and attempts to stop the build in case of errors
 		"""
-		tsk.process()
+		await tsk.async_process()
 		if tsk.hasrun != Task.SUCCESS:
 			self.error_handler(tsk)
 
@@ -416,7 +416,7 @@ class Parallel(object):
 				if self.numjobs == 1:
 					tsk.log_display(tsk.generator.bld)
 					try:
-						self.process_task(tsk)
+						await self.process_task(tsk)
 					finally:
 						await self.out.put(tsk)
 				else:
@@ -438,7 +438,7 @@ class Parallel(object):
 		# self.count represents the tasks that have been made available to the consumer threads
 		# collect all the tasks after an error else the message may be incomplete
 		while self.error and self.count:
-			self.get_out()
+			await self.get_out()
 
 		await self.ready.put(None)
 		if not self.stop:
