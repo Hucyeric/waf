@@ -1034,6 +1034,14 @@ async def async_run_process(cmd, kwargs, cargs={}):
 	else:
 		return run_regular_process(cmd, kwargs, cargs)
 
+async def async_alloc_process_pool(n):
+	lst = []
+	for x in range(n):
+		x = await async_get_process()
+		lst.append(x)
+	for x in lst:
+		async_process_pool.append(x)
+
 def alloc_process_pool(n, force=False):
 	"""
 	Allocates an amount of processes to the default pool so its size is at least *n*.
@@ -1057,6 +1065,9 @@ def alloc_process_pool(n, force=False):
 	else:
 		for x in lst:
 			process_pool.append(x)
+
+	loop = asyncio.get_event_loop()
+	loop.run_until_complete(async_alloc_process_pool(n))
 
 def atexit_pool():
 	for k in process_pool:
