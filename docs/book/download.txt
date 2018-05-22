@@ -50,7 +50,7 @@ $ ls -ld .waf*
 .waf-{version}-2c924e3f453eb715218b9cc852291170
 ---------------
 
-No installation is necessary, but the Python interpreter must feature a http://docs.python.org/library/bz2.html[bzip2 decompressor]; if this module is missing, then it may be necessary to build Waf from source (consult the next sections). The folder containing the waf file must also be writable so that the waf file can uncompress its library.
+No installation is necessary, but the Python interpreter must feature a http://docs.python.org/library/bz2.html[bzip2 decompressor]; if this module is missing, then it may be necessary to build Waf from source (consult the next sections). The folder containing the waf file must also be writable so that the waf file can decompress its library.
 
 If the above conditions are not met, an alternative is to point the environment variable _WAFDIR_ to the folder containing the directory named https://github.com/waf-project/waf/tree/master/waflib[waflib]. Though this waflib folder may be provided as part of project source files, the files cannot run in both Python 2 and Python 3 at the same time, so this is generally discouraged.
 
